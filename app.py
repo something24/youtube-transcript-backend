@@ -4,23 +4,20 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
-    VideoUnavailable
+    VideoUnavailable,
+    TooManyRequests,
+    YouTubeRequestFailed
 )
 import os
 import re
+import logging
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for iOS app
+CORS(app)
 
-# Optional: API Key authentication
-API_KEY = os.environ.get('API_KEY', 'your-secret-key')
-
-def verify_api_key():
-    """Verify API key from request headers"""
-    provided_key = request.headers.get('X-API-Key')
-    if not provided_key or provided_key != API_KEY:
-        return False
-    return True
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def extract_video_id(url):
     """Extract video ID from various YouTube URL formats"""
@@ -36,7 +33,6 @@ def extract_video_id(url):
         if match:
             return match.group(1)
     
-    # If no pattern matches, assume it's already a video ID
     if re.match(r'^[a-zA-Z0-9_-]{11}$', url):
         return url
     
@@ -48,7 +44,12 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'YouTube Transcript API',
-        'version': '1.0.0'
+        'version': '1.0.0',
+        'endpoints': {
+            '/health': 'Health check',
+            '/transcript/<video_id>': 'Get transcript by video ID',
+            '/transcript (POST)': 'Get transcript by URL'
+        }
     })
 
 @app.route('/health')
@@ -58,49 +59,54 @@ def health():
 
 @app.route('/transcript/<video_id>', methods=['GET'])
 def get_transcript(video_id):
-    """
-    Get transcript for a YouTube video
-    
-    Args:
-        video_id: YouTube video ID (11 characters)
-    
-    Query params:
-        lang: Preferred language code (default: en)
-        
-    Returns:
-        JSON with transcript text and metadata
-    """
-    # Optional: Verify API key
-    # if not verify_api_key():
-    #     return jsonify({'error': 'Invalid or missing API key'}), 401
-    
+    """Get transcript for a YouTube video"""
     try:
+        logger.info(f"Fetching transcript for video: {video_id}")
+        
         # Get preferred language from query params
         preferred_lang = request.args.get('lang', 'en')
         
-        # Fetch transcript
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        # Fetch transcript with retry logic
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        except Exception as e:
+            logger.error(f"Error listing transcripts: {str(e)}")
+            raise
         
         # Try to get transcript in preferred language
+        transcript = None
         try:
             transcript = transcript_list.find_transcript([preferred_lang])
+            logger.info(f"Found transcript in {preferred_lang}")
         except NoTranscriptFound:
-            # Fallback to any available transcript
-            transcript = transcript_list.find_transcript(
-                transcript_list._manually_created_transcripts.keys() or
-                transcript_list._generated_transcripts.keys()
-            )
+            logger.info(f"No transcript in {preferred_lang}, trying alternatives")
+            # Try manually created transcripts first
+            if transcript_list._manually_created_transcripts:
+                transcript = list(transcript_list._manually_created_transcripts.values())[0]
+                logger.info(f"Using manually created transcript in {transcript.language_code}")
+            # Fall back to auto-generated
+            elif transcript_list._generated_transcripts:
+                transcript = list(transcript_list._generated_transcripts.values())[0]
+                logger.info(f"Using auto-generated transcript in {transcript.language_code}")
+            else:
+                raise NoTranscriptFound("No transcripts available")
         
-        # Get the actual transcript data
-        transcript_data = transcript.fetch()
+        # Fetch the actual transcript data
+        try:
+            transcript_data = transcript.fetch()
+        except Exception as e:
+            logger.error(f"Error fetching transcript data: {str(e)}")
+            raise
         
         # Combine all text segments
         full_text = ' '.join([entry['text'] for entry in transcript_data])
         
         # Clean up the text
-        full_text = full_text.replace('\n', ' ').strip()
+        full_text = full_text.replace('\n', ' ').replace('  ', ' ').strip()
         
-        # Get video metadata (language, etc)
+        logger.info(f"Successfully fetched transcript ({len(full_text)} chars)")
+        
+        # Return transcript with metadata
         return jsonify({
             'success': True,
             'video_id': video_id,
@@ -112,46 +118,57 @@ def get_transcript(video_id):
         }), 200
         
     except TranscriptsDisabled:
+        logger.warning(f"Transcripts disabled for video: {video_id}")
         return jsonify({
             'success': False,
-            'error': 'Transcripts are disabled for this video'
+            'error': 'Transcripts are disabled for this video',
+            'video_id': video_id
         }), 400
         
     except NoTranscriptFound:
+        logger.warning(f"No transcript found for video: {video_id}")
         return jsonify({
             'success': False,
-            'error': 'No transcript found for this video'
+            'error': 'No transcript found for this video. The video may not have captions available.',
+            'video_id': video_id
         }), 404
         
     except VideoUnavailable:
+        logger.warning(f"Video unavailable: {video_id}")
         return jsonify({
             'success': False,
-            'error': 'Video is unavailable or does not exist'
+            'error': 'Video is unavailable or does not exist',
+            'video_id': video_id
         }), 404
         
-    except Exception as e:
+    except TooManyRequests:
+        logger.error(f"Rate limited for video: {video_id}")
         return jsonify({
             'success': False,
-            'error': f'An error occurred: {str(e)}'
+            'error': 'Too many requests. Please try again later.',
+            'video_id': video_id
+        }), 429
+        
+    except YouTubeRequestFailed as e:
+        logger.error(f"YouTube request failed for {video_id}: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to fetch from YouTube: {str(e)}',
+            'video_id': video_id
+        }), 503
+        
+    except Exception as e:
+        logger.error(f"Unexpected error for {video_id}: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'An error occurred: {str(e)}',
+            'video_id': video_id,
+            'hint': 'This video may not have transcripts available or may be region-restricted'
         }), 500
 
 @app.route('/transcript', methods=['POST'])
 def get_transcript_from_url():
-    """
-    Get transcript from a full YouTube URL
-    
-    Body:
-        {
-            "url": "https://youtube.com/watch?v=..."
-        }
-    
-    Returns:
-        JSON with transcript text and metadata
-    """
-    # Optional: Verify API key
-    # if not verify_api_key():
-    #     return jsonify({'error': 'Invalid or missing API key'}), 401
-    
+    """Get transcript from a full YouTube URL"""
     data = request.get_json()
     
     if not data or 'url' not in data:
@@ -169,7 +186,7 @@ def get_transcript_from_url():
             'error': 'Invalid YouTube URL or video ID'
         }), 400
     
-    # Forward to the GET endpoint logic
+    # Forward to the GET endpoint
     request.view_args = {'video_id': video_id}
     return get_transcript(video_id)
 
@@ -220,6 +237,7 @@ def not_found(error):
 
 @app.errorhandler(500)
 def internal_error(error):
+    logger.error(f"Internal server error: {str(error)}")
     return jsonify({
         'success': False,
         'error': 'Internal server error'
@@ -228,3 +246,17 @@ def internal_error(error):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
+
+# File: requirements.txt
+"""
+Flask==3.0.0
+flask-cors==4.0.0
+youtube-transcript-api==0.6.2
+gunicorn==21.2.0
+"""
+
+# File: Procfile (for Railway/Heroku)
+"""
+web: gunicorn app:app
+"""
