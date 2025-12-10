@@ -1,16 +1,11 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-    TooManyRequests,
-    YouTubeRequestFailed
-)
 import os
 import re
 import logging
+import subprocess
+import json
+import tempfile
 
 app = Flask(__name__)
 CORS(app)
@@ -38,13 +33,112 @@ def extract_video_id(url):
     
     return None
 
+def get_transcript_with_ytdlp(video_id):
+    """
+    Fetch transcript using yt-dlp
+    Returns: tuple (transcript_text, language_code, metadata)
+    """
+    try:
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Get video info including subtitles
+        cmd = [
+            'yt-dlp',
+            '--skip-download',
+            '--write-auto-subs',
+            '--write-subs',
+            '--sub-langs', 'en,en-US,en-GB',
+            '--sub-format', 'json3',
+            '--print', '%(subtitles)s',
+            '--print', '%(automatic_captions)s',
+            video_url
+        ]
+        
+        logger.info(f"Running yt-dlp for video: {video_id}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            logger.error(f"yt-dlp error: {result.stderr}")
+            raise Exception(f"yt-dlp failed: {result.stderr}")
+        
+        # Try to get subtitles with different approach
+        cmd = [
+            'yt-dlp',
+            '--skip-download',
+            '--write-auto-subs',
+            '--sub-langs', 'en',
+            '--sub-format', 'vtt',
+            '--output', 'subtitle',
+            video_url
+        ]
+        
+        # Create temporary directory
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Change to temp directory
+            original_dir = os.getcwd()
+            os.chdir(tmpdir)
+            
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                # Look for subtitle files
+                subtitle_files = [f for f in os.listdir('.') if f.endswith('.vtt')]
+                
+                if not subtitle_files:
+                    raise Exception("No subtitle files generated")
+                
+                # Read the subtitle file
+                with open(subtitle_files[0], 'r', encoding='utf-8') as f:
+                    vtt_content = f.read()
+                
+                # Parse VTT content
+                transcript = parse_vtt(vtt_content)
+                
+                return transcript, 'en', {'is_generated': 'auto' in subtitle_files[0].lower()}
+                
+            finally:
+                os.chdir(original_dir)
+        
+    except subprocess.TimeoutExpired:
+        raise Exception("Request timeout - video may be too long or unavailable")
+    except Exception as e:
+        logger.error(f"Error in get_transcript_with_ytdlp: {str(e)}")
+        raise
+
+def parse_vtt(vtt_content):
+    """Parse VTT subtitle format and extract text"""
+    lines = vtt_content.split('\n')
+    transcript_parts = []
+    
+    for line in lines:
+        line = line.strip()
+        # Skip WEBVTT header, timestamps, and empty lines
+        if (line and
+            not line.startswith('WEBVTT') and
+            not line.startswith('Kind:') and
+            not line.startswith('Language:') and
+            '-->' not in line and
+            not line.startswith('NOTE') and
+            not line.isdigit()):
+            # Remove VTT formatting tags
+            line = re.sub(r'<[^>]+>', '', line)
+            if line:
+                transcript_parts.append(line)
+    
+    # Join and clean up
+    transcript = ' '.join(transcript_parts)
+    transcript = re.sub(r'\s+', ' ', transcript).strip()
+    
+    return transcript
+
 @app.route('/')
 def home():
     """Health check endpoint"""
     return jsonify({
         'status': 'ok',
         'service': 'YouTube Transcript API',
-        'version': '1.0.0',
+        'version': '2.0.0',
+        'method': 'yt-dlp',
         'endpoints': {
             '/health': 'Health check',
             '/transcript/<video_id>': 'Get transcript by video ID',
@@ -63,108 +157,64 @@ def get_transcript(video_id):
     try:
         logger.info(f"Fetching transcript for video: {video_id}")
         
-        # Get preferred language from query params
-        preferred_lang = request.args.get('lang', 'en')
+        # Get transcript using yt-dlp
+        transcript, language, metadata = get_transcript_with_ytdlp(video_id)
         
-        # Fetch transcript with retry logic
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        except Exception as e:
-            logger.error(f"Error listing transcripts: {str(e)}")
-            raise
+        if not transcript:
+            raise Exception("No transcript content retrieved")
         
-        # Try to get transcript in preferred language
-        transcript = None
-        try:
-            transcript = transcript_list.find_transcript([preferred_lang])
-            logger.info(f"Found transcript in {preferred_lang}")
-        except NoTranscriptFound:
-            logger.info(f"No transcript in {preferred_lang}, trying alternatives")
-            # Try manually created transcripts first
-            if transcript_list._manually_created_transcripts:
-                transcript = list(transcript_list._manually_created_transcripts.values())[0]
-                logger.info(f"Using manually created transcript in {transcript.language_code}")
-            # Fall back to auto-generated
-            elif transcript_list._generated_transcripts:
-                transcript = list(transcript_list._generated_transcripts.values())[0]
-                logger.info(f"Using auto-generated transcript in {transcript.language_code}")
-            else:
-                raise NoTranscriptFound("No transcripts available")
-        
-        # Fetch the actual transcript data
-        try:
-            transcript_data = transcript.fetch()
-        except Exception as e:
-            logger.error(f"Error fetching transcript data: {str(e)}")
-            raise
-        
-        # Combine all text segments
-        full_text = ' '.join([entry['text'] for entry in transcript_data])
-        
-        # Clean up the text
-        full_text = full_text.replace('\n', ' ').replace('  ', ' ').strip()
-        
-        logger.info(f"Successfully fetched transcript ({len(full_text)} chars)")
+        logger.info(f"Successfully fetched transcript ({len(transcript)} chars)")
         
         # Return transcript with metadata
         return jsonify({
             'success': True,
             'video_id': video_id,
-            'transcript': full_text,
-            'language': transcript.language_code,
-            'is_generated': transcript.is_generated,
-            'is_translatable': transcript.is_translatable,
-            'word_count': len(full_text.split()),
+            'transcript': transcript,
+            'language': language,
+            'is_generated': metadata.get('is_generated', True),
+            'word_count': len(transcript.split()),
         }), 200
         
-    except TranscriptsDisabled:
-        logger.warning(f"Transcripts disabled for video: {video_id}")
+    except subprocess.TimeoutExpired:
+        logger.error(f"Timeout for video: {video_id}")
         return jsonify({
             'success': False,
-            'error': 'Transcripts are disabled for this video',
+            'error': 'Request timeout - video may be too long or unavailable',
             'video_id': video_id
-        }), 400
-        
-    except NoTranscriptFound:
-        logger.warning(f"No transcript found for video: {video_id}")
-        return jsonify({
-            'success': False,
-            'error': 'No transcript found for this video. The video may not have captions available.',
-            'video_id': video_id
-        }), 404
-        
-    except VideoUnavailable:
-        logger.warning(f"Video unavailable: {video_id}")
-        return jsonify({
-            'success': False,
-            'error': 'Video is unavailable or does not exist',
-            'video_id': video_id
-        }), 404
-        
-    except TooManyRequests:
-        logger.error(f"Rate limited for video: {video_id}")
-        return jsonify({
-            'success': False,
-            'error': 'Too many requests. Please try again later.',
-            'video_id': video_id
-        }), 429
-        
-    except YouTubeRequestFailed as e:
-        logger.error(f"YouTube request failed for {video_id}: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': f'Failed to fetch from YouTube: {str(e)}',
-            'video_id': video_id
-        }), 503
+        }), 408
         
     except Exception as e:
-        logger.error(f"Unexpected error for {video_id}: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': f'An error occurred: {str(e)}',
-            'video_id': video_id,
-            'hint': 'This video may not have transcripts available or may be region-restricted'
-        }), 500
+        error_msg = str(e).lower()
+        
+        if 'no subtitle' in error_msg or 'no transcript' in error_msg:
+            logger.warning(f"No transcript found for video: {video_id}")
+            return jsonify({
+                'success': False,
+                'error': 'No transcript found for this video. The video may not have captions available.',
+                'video_id': video_id
+            }), 404
+        elif 'unavailable' in error_msg or 'not exist' in error_msg:
+            logger.warning(f"Video unavailable: {video_id}")
+            return jsonify({
+                'success': False,
+                'error': 'Video is unavailable or does not exist',
+                'video_id': video_id
+            }), 404
+        elif 'private' in error_msg:
+            logger.warning(f"Video is private: {video_id}")
+            return jsonify({
+                'success': False,
+                'error': 'Video is private',
+                'video_id': video_id
+            }), 403
+        else:
+            logger.error(f"Unexpected error for {video_id}: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'An error occurred: {str(e)}',
+                'video_id': video_id,
+                'hint': 'This video may not have transcripts available or may be region-restricted'
+            }), 500
 
 @app.route('/transcript', methods=['POST'])
 def get_transcript_from_url():
@@ -190,44 +240,6 @@ def get_transcript_from_url():
     request.view_args = {'video_id': video_id}
     return get_transcript(video_id)
 
-@app.route('/languages/<video_id>', methods=['GET'])
-def get_available_languages(video_id):
-    """Get all available transcript languages for a video"""
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        languages = []
-        
-        # Get manually created transcripts
-        for transcript in transcript_list._manually_created_transcripts.values():
-            languages.append({
-                'language': transcript.language,
-                'language_code': transcript.language_code,
-                'is_generated': False,
-                'is_translatable': transcript.is_translatable
-            })
-        
-        # Get auto-generated transcripts
-        for transcript in transcript_list._generated_transcripts.values():
-            languages.append({
-                'language': transcript.language,
-                'language_code': transcript.language_code,
-                'is_generated': True,
-                'is_translatable': transcript.is_translatable
-            })
-        
-        return jsonify({
-            'success': True,
-            'video_id': video_id,
-            'languages': languages
-        }), 200
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
@@ -246,17 +258,3 @@ def internal_error(error):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
-# File: requirements.txt
-"""
-Flask==3.0.0
-flask-cors==4.0.0
-youtube-transcript-api==0.6.2
-gunicorn==21.2.0
-"""
-
-# File: Procfile (for Railway/Heroku)
-"""
-web: gunicorn app:app
-"""
