@@ -1,14 +1,28 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import os
 import re
 import logging
 import subprocess
-import json
 import tempfile
 
 app = Flask(__name__)
 CORS(app)
+
+# Rate limiting - configurable via environment
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["100 per hour", "10 per minute"]
+)
+
+# Limit max request body size (1KB should be plenty for a URL)
+app.config['MAX_CONTENT_LENGTH'] = 1024
+
+# Configurable timeout for yt-dlp (default 30 seconds)
+YTDLP_TIMEOUT = int(os.environ.get('YTDLP_TIMEOUT', 30))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,65 +54,53 @@ def get_transcript_with_ytdlp(video_id):
     """
     try:
         video_url = f"https://www.youtube.com/watch?v={video_id}"
-        
-        # Get video info including subtitles
-        cmd = [
-            'yt-dlp',
-            '--skip-download',
-            '--write-auto-subs',
-            '--write-subs',
-            '--sub-langs', 'en,en-US,en-GB',
-            '--sub-format', 'json3',
-            '--print', '%(subtitles)s',
-            '--print', '%(automatic_captions)s',
-            video_url
-        ]
-        
+
         logger.info(f"Running yt-dlp for video: {video_id}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode != 0:
-            logger.error(f"yt-dlp error: {result.stderr}")
-            raise Exception(f"yt-dlp failed: {result.stderr}")
-        
-        # Try to get subtitles with different approach
-        cmd = [
-            'yt-dlp',
-            '--skip-download',
-            '--write-auto-subs',
-            '--sub-langs', 'en',
-            '--sub-format', 'vtt',
-            '--output', 'subtitle',
-            video_url
-        ]
-        
-        # Create temporary directory
+
+        # Create temporary directory for subtitle files
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Change to temp directory
-            original_dir = os.getcwd()
-            os.chdir(tmpdir)
-            
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                
-                # Look for subtitle files
-                subtitle_files = [f for f in os.listdir('.') if f.endswith('.vtt')]
-                
-                if not subtitle_files:
-                    raise Exception("No subtitle files generated")
-                
-                # Read the subtitle file
-                with open(subtitle_files[0], 'r', encoding='utf-8') as f:
-                    vtt_content = f.read()
-                
-                # Parse VTT content
-                transcript = parse_vtt(vtt_content)
-                
-                return transcript, 'en', {'is_generated': 'auto' in subtitle_files[0].lower()}
-                
-            finally:
-                os.chdir(original_dir)
-        
+            output_template = os.path.join(tmpdir, 'subtitle')
+
+            cmd = [
+                'yt-dlp',
+                '--skip-download',
+                '--write-auto-subs',
+                '--write-subs',
+                '--sub-langs', 'en,en-US,en-GB',
+                '--sub-format', 'vtt',
+                '--output', output_template,
+                video_url
+            ]
+
+            # Run yt-dlp with cwd parameter (thread-safe)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=YTDLP_TIMEOUT,
+                cwd=tmpdir
+            )
+
+            if result.returncode != 0:
+                logger.error(f"yt-dlp error: {result.stderr}")
+                raise Exception("Failed to fetch subtitles")
+
+            # Look for subtitle files in temp directory
+            subtitle_files = [f for f in os.listdir(tmpdir) if f.endswith('.vtt')]
+
+            if not subtitle_files:
+                raise Exception("No subtitle files generated")
+
+            # Read the subtitle file
+            subtitle_path = os.path.join(tmpdir, subtitle_files[0])
+            with open(subtitle_path, 'r', encoding='utf-8') as f:
+                vtt_content = f.read()
+
+            # Parse VTT content
+            transcript = parse_vtt(vtt_content)
+
+            return transcript, 'en', {'is_generated': 'auto' in subtitle_files[0].lower()}
+
     except subprocess.TimeoutExpired:
         raise Exception("Request timeout - video may be too long or unavailable")
     except Exception as e:
@@ -154,6 +156,13 @@ def health():
 @app.route('/transcript/<video_id>', methods=['GET'])
 def get_transcript(video_id):
     """Get transcript for a YouTube video"""
+    # Validate video_id format to prevent command injection
+    if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
+        return jsonify({
+            'success': False,
+            'error': 'Invalid video ID format'
+        }), 400
+
     try:
         logger.info(f"Fetching transcript for video: {video_id}")
         
@@ -208,10 +217,11 @@ def get_transcript(video_id):
                 'video_id': video_id
             }), 403
         else:
+            # Log full error for debugging but return generic message to client
             logger.error(f"Unexpected error for {video_id}: {str(e)}")
             return jsonify({
                 'success': False,
-                'error': f'An error occurred: {str(e)}',
+                'error': 'An error occurred while fetching the transcript',
                 'video_id': video_id,
                 'hint': 'This video may not have transcripts available or may be region-restricted'
             }), 500
