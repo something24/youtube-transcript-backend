@@ -24,9 +24,32 @@ app.config['MAX_CONTENT_LENGTH'] = 1024
 # Configurable timeout for yt-dlp (default 30 seconds)
 YTDLP_TIMEOUT = int(os.environ.get('YTDLP_TIMEOUT', 30))
 
+# API key for authentication (set in Railway environment variables)
+APP_API_KEY = os.environ.get('APP_API_KEY')
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def require_api_key(f):
+    """Decorator to require API key for protected endpoints"""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not APP_API_KEY:
+            # If no API key configured, allow requests (for backwards compatibility during setup)
+            logger.warning("APP_API_KEY not configured - endpoint is unprotected")
+            return f(*args, **kwargs)
+
+        provided_key = request.headers.get('X-API-Key')
+        if not provided_key or provided_key != APP_API_KEY:
+            logger.warning(f"Unauthorized request attempt from {request.remote_addr}")
+            return jsonify({
+                'success': False,
+                'error': 'Unauthorized - invalid or missing API key'
+            }), 401
+        return f(*args, **kwargs)
+    return decorated
 
 def extract_video_id(url):
     """Extract video ID from various YouTube URL formats"""
@@ -154,6 +177,7 @@ def health():
     return jsonify({'status': 'healthy'}), 200
 
 @app.route('/transcript/<video_id>', methods=['GET'])
+@require_api_key
 def get_transcript(video_id):
     """Get transcript for a YouTube video"""
     # Validate video_id format to prevent command injection
@@ -227,6 +251,7 @@ def get_transcript(video_id):
             }), 500
 
 @app.route('/transcript', methods=['POST'])
+@require_api_key
 def get_transcript_from_url():
     """Get transcript from a full YouTube URL"""
     data = request.get_json()
