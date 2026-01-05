@@ -7,11 +7,15 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
-    NoTranscriptAvailable
+    NoTranscriptAvailable,
+    RequestBlocked
 )
 import os
 import re
 import logging
+
+# Initialize the transcript API client
+ytt_api = YouTubeTranscriptApi()
 
 app = Flask(__name__)
 CORS(app)
@@ -74,13 +78,13 @@ def extract_video_id(url):
 
 def get_transcript(video_id):
     """
-    Fetch transcript using youtube-transcript-api
+    Fetch transcript using youtube-transcript-api v1.x
     Returns: tuple (transcript_text, language_code, is_generated)
     """
     logger.info(f"Fetching transcript for video: {video_id}")
 
     # Try to get transcript - prefer manual captions, fall back to auto-generated
-    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    transcript_list = ytt_api.list(video_id)
 
     transcript = None
     is_generated = False
@@ -128,7 +132,7 @@ def get_transcript(video_id):
 
     # Fetch and combine transcript text
     transcript_data = transcript.fetch()
-    transcript_text = ' '.join([entry['text'] for entry in transcript_data])
+    transcript_text = ' '.join([entry.text for entry in transcript_data])
 
     # Clean up the text
     transcript_text = re.sub(r'\s+', ' ', transcript_text).strip()
@@ -219,6 +223,15 @@ def get_transcript_endpoint(video_id):
             'error': 'Video is unavailable or does not exist',
             'video_id': video_id
         }), 404
+
+    except RequestBlocked:
+        logger.error(f"Request blocked by YouTube for video: {video_id}")
+        return jsonify({
+            'success': False,
+            'error': 'Request blocked by YouTube',
+            'hint': 'YouTube may be rate-limiting requests. Please try again later.',
+            'video_id': video_id
+        }), 429
 
     except Exception as e:
         logger.error(f"Unexpected error for {video_id}: {str(e)}")
