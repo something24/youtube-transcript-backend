@@ -7,7 +7,6 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
-    NoTranscriptAvailable,
     RequestBlocked
 )
 import os
@@ -125,10 +124,10 @@ def get_transcript(video_id):
                 break
         except Exception as e:
             logger.error(f"Error getting fallback transcript: {e}")
-            raise NoTranscriptAvailable(video_id)
+            raise NoTranscriptFound(video_id)
 
     if transcript is None:
-        raise NoTranscriptAvailable(video_id)
+        raise NoTranscriptFound(video_id)
 
     # Fetch and combine transcript text
     transcript_data = transcript.fetch()
@@ -176,7 +175,7 @@ def get_transcript_endpoint(video_id):
         transcript, language, is_generated = get_transcript(video_id)
 
         if not transcript:
-            raise NoTranscriptAvailable(video_id)
+            raise NoTranscriptFound(video_id)
 
         logger.info(f"Successfully fetched transcript ({len(transcript)} chars)")
 
@@ -204,15 +203,6 @@ def get_transcript_endpoint(video_id):
             'success': False,
             'error': 'No transcript found for this video',
             'hint': 'The video may not have captions available in any language',
-            'video_id': video_id
-        }), 404
-
-    except NoTranscriptAvailable:
-        logger.warning(f"No transcript available for video: {video_id}")
-        return jsonify({
-            'success': False,
-            'error': 'No transcript available for this video',
-            'hint': 'The video may not have captions available',
             'video_id': video_id
         }), 404
 
