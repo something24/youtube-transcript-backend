@@ -75,10 +75,11 @@ def extract_video_id(url):
     
     return None
 
-def get_transcript(video_id):
+def get_transcript(video_id, include_timestamps=False):
     """
     Fetch transcript using youtube-transcript-api v1.x
-    Returns: tuple (transcript_text, language_code, is_generated)
+    Returns: tuple (transcript_text_or_segments, language_code, is_generated)
+    If include_timestamps=True, returns list of {text, start, duration} segments
     """
     logger.info(f"Fetching transcript for video: {video_id}")
 
@@ -129,15 +130,27 @@ def get_transcript(video_id):
     if transcript is None:
         raise NoTranscriptFound(video_id)
 
-    # Fetch and combine transcript text
+    # Fetch transcript data
     transcript_data = transcript.fetch()
-    transcript_text = ' '.join([entry.text for entry in transcript_data])
 
-    # Clean up the text
-    transcript_text = re.sub(r'\s+', ' ', transcript_text).strip()
-    transcript_text = re.sub(r'\[.*?\]', '', transcript_text)  # Remove [Music], [Applause], etc.
-
-    return transcript_text, language, is_generated
+    if include_timestamps:
+        # Return segments with timing information
+        segments = []
+        for entry in transcript_data:
+            text = re.sub(r'\[.*?\]', '', entry.text).strip()  # Remove [Music], etc.
+            if text:  # Only include non-empty segments
+                segments.append({
+                    'text': text,
+                    'start': entry.start,
+                    'duration': entry.duration
+                })
+        return segments, language, is_generated
+    else:
+        # Original behavior - combine into plain text
+        transcript_text = ' '.join([entry.text for entry in transcript_data])
+        transcript_text = re.sub(r'\s+', ' ', transcript_text).strip()
+        transcript_text = re.sub(r'\[.*?\]', '', transcript_text)  # Remove [Music], [Applause], etc.
+        return transcript_text, language, is_generated
 
 @app.route('/')
 def home():
@@ -170,24 +183,37 @@ def get_transcript_endpoint(video_id):
             'error': 'Invalid video ID format'
         }), 400
 
+    # Check if timestamps are requested
+    include_timestamps = request.args.get('timestamps', 'false').lower() == 'true'
+
     try:
         # Get transcript using youtube-transcript-api
-        transcript, language, is_generated = get_transcript(video_id)
+        result, language, is_generated = get_transcript(video_id, include_timestamps)
 
-        if not transcript:
+        if not result:
             raise NoTranscriptFound(video_id)
 
-        logger.info(f"Successfully fetched transcript ({len(transcript)} chars)")
-
-        # Return transcript with metadata
-        return jsonify({
-            'success': True,
-            'video_id': video_id,
-            'transcript': transcript,
-            'language': language,
-            'is_generated': is_generated,
-            'word_count': len(transcript.split()),
-        }), 200
+        if include_timestamps:
+            # Return segments with timing
+            logger.info(f"Successfully fetched transcript ({len(result)} segments)")
+            return jsonify({
+                'success': True,
+                'video_id': video_id,
+                'segments': result,
+                'language': language,
+                'is_generated': is_generated,
+            }), 200
+        else:
+            # Return plain text (original behavior)
+            logger.info(f"Successfully fetched transcript ({len(result)} chars)")
+            return jsonify({
+                'success': True,
+                'video_id': video_id,
+                'transcript': result,
+                'language': language,
+                'is_generated': is_generated,
+                'word_count': len(result.split()),
+            }), 200
 
     except TranscriptsDisabled:
         logger.warning(f"Transcripts disabled for video: {video_id}")
