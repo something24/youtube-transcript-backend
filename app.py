@@ -109,7 +109,7 @@ def get_transcript(video_id, include_timestamps=False):
         except NoTranscriptFound:
             pass
 
-    # Fall back to any available transcript and translate to English
+    # Fall back to any available transcript and try to translate to English
     if transcript is None:
         try:
             # Get any available transcript
@@ -117,11 +117,17 @@ def get_transcript(video_id, include_timestamps=False):
                 transcript = t
                 is_generated = t.is_generated
                 language = t.language_code
-                logger.info(f"Found transcript in {language}, will translate to English")
-                # Translate to English if not already English
-                if not language.startswith('en'):
-                    transcript = transcript.translate('en')
-                    language = 'en'
+                logger.info(f"Found transcript in {language}")
+                # Try to translate to English if not already English and translatable
+                if not language.startswith('en') and t.is_translatable:
+                    try:
+                        transcript = transcript.translate('en')
+                        language = 'en'
+                        logger.info(f"Translated to English")
+                    except Exception as te:
+                        logger.warning(f"Translation failed, using original language: {te}")
+                elif not language.startswith('en'):
+                    logger.info(f"Transcript not translatable, using original language: {language}")
                 break
         except Exception as e:
             logger.error(f"Error getting fallback transcript: {e}")
