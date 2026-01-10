@@ -125,10 +125,10 @@ def get_transcript(video_id, include_timestamps=False):
                 break
         except Exception as e:
             logger.error(f"Error getting fallback transcript: {e}")
-            raise NoTranscriptFound(video_id)
+            raise Exception(f"No transcript found for video {video_id}")
 
     if transcript is None:
-        raise NoTranscriptFound(video_id)
+        raise Exception(f"No transcript available for video {video_id}")
 
     # Fetch transcript data
     transcript_data = transcript.fetch()
