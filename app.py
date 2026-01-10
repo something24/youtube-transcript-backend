@@ -172,6 +172,36 @@ def health():
     """Health check for monitoring"""
     return jsonify({'status': 'healthy'}), 200
 
+@app.route('/debug/<video_id>', methods=['GET'])
+@require_api_key
+def debug_transcripts(video_id):
+    """List all available transcripts for a video (for debugging)"""
+    if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
+        return jsonify({'success': False, 'error': 'Invalid video ID'}), 400
+
+    try:
+        transcript_list = ytt_api.list(video_id)
+        available = []
+        for t in transcript_list:
+            available.append({
+                'language': t.language,
+                'language_code': t.language_code,
+                'is_generated': t.is_generated,
+                'is_translatable': t.is_translatable
+            })
+        return jsonify({
+            'success': True,
+            'video_id': video_id,
+            'available_transcripts': available,
+            'count': len(available)
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'video_id': video_id
+        }), 500
+
 @app.route('/transcript/<video_id>', methods=['GET'])
 @require_api_key
 def get_transcript_endpoint(video_id):
