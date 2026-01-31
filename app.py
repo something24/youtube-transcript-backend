@@ -7,12 +7,7 @@ Flask application for:
 """
 
 import os
-import sys
 import logging
-
-# Add app directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
