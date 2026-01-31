@@ -6,7 +6,13 @@ Flask application for:
 - AI completion proxy (Gemini)
 """
 
+# Setup path FIRST before any other imports
+import sys
 import os
+_app_dir = os.path.dirname(os.path.abspath(__file__))
+if _app_dir not in sys.path:
+    sys.path.insert(0, _app_dir)
+
 import logging
 from flask import Flask, jsonify
 from flask_cors import CORS
