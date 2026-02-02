@@ -41,8 +41,8 @@ limiter = Limiter(
     default_limits=["100 per hour", "10 per minute"]
 )
 
-# Limit max request body size (100KB for AI prompts)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024
+# Limit max request body size (1MB for AI prompts with long transcripts)
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB
 
 # Environment variables
 APP_API_KEY = os.environ.get('APP_API_KEY')
