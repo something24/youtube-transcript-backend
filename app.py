@@ -47,7 +47,7 @@ app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB
 # Environment variables
 APP_API_KEY = os.environ.get('APP_API_KEY')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # Initialize YouTube transcript API
