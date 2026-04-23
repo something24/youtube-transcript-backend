@@ -8,6 +8,7 @@ Flask application for:
 
 import os
 import re
+import time
 import logging
 import requests
 from functools import wraps
@@ -47,8 +48,10 @@ app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB
 # Environment variables
 APP_API_KEY = os.environ.get('APP_API_KEY')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+SUPADATA_API_KEY = os.environ.get('SUPADATA_API_KEY')
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+SUPADATA_BASE_URL = "https://api.supadata.ai/v1"
 
 # Initialize YouTube transcript API
 ytt_api = YouTubeTranscriptApi()
@@ -184,6 +187,77 @@ def get_transcript(video_id, include_timestamps=False):
 
 
 # =============================================================================
+# SUPADATA SERVICE
+# =============================================================================
+
+def get_supadata_transcript(video_id, include_timestamps=False):
+    """Fetch transcript from Supadata API (paid fallback)."""
+    if not SUPADATA_API_KEY:
+        raise Exception("Supadata API key not configured")
+
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    text_param = "false" if include_timestamps else "true"
+    url = f"{SUPADATA_BASE_URL}/transcript?url={video_url}&text={text_param}"
+
+    headers = {"x-api-key": SUPADATA_API_KEY}
+
+    # Retry logic for 202 responses (async processing)
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        response = requests.get(url, headers=headers, timeout=30)
+
+        if response.status_code == 202:
+            if attempt < max_attempts:
+                logger.info(f"Supadata: transcript processing (attempt {attempt}/{max_attempts}), retrying...")
+                time.sleep(3)
+                continue
+            raise Exception("Supadata transcript processing timed out")
+
+        if response.status_code != 200:
+            raise Exception(f"Supadata API error: {response.status_code}")
+
+        data = response.json()
+
+        if include_timestamps:
+            segments = []
+            for seg in data.get('content', []):
+                text = seg.get('text', '').strip()
+                if text:
+                    segments.append({
+                        'text': text,
+                        'start': seg.get('offset', 0) / 1000.0,
+                        'duration': seg.get('duration', 0) / 1000.0
+                    })
+            language = data.get('lang', 'en')
+            logger.info(f"Supadata: fetched {len(segments)} segments")
+            return segments, language, False
+        else:
+            content = data.get('content', '')
+            language = data.get('lang', 'en')
+            logger.info(f"Supadata: fetched transcript ({len(content)} chars)")
+            return content, language, False
+
+    raise Exception("Supadata transcript fetch failed")
+
+
+def get_supadata_metadata(video_id):
+    """Fetch video metadata from Supadata API."""
+    if not SUPADATA_API_KEY:
+        raise Exception("Supadata API key not configured")
+
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    url = f"{SUPADATA_BASE_URL}/metadata?url={video_url}"
+
+    headers = {"x-api-key": SUPADATA_API_KEY}
+    response = requests.get(url, headers=headers, timeout=15)
+
+    if response.status_code != 200:
+        raise Exception(f"Supadata metadata error: {response.status_code}")
+
+    return response.json()
+
+
+# =============================================================================
 # AI SERVICE
 # =============================================================================
 
@@ -261,6 +335,7 @@ def home():
             '/health': 'Health check',
             '/transcript/<video_id>': 'Get transcript by video ID',
             '/transcript (POST)': 'Get transcript by URL',
+            '/metadata/<video_id>': 'Get video metadata (duration, title)',
             '/debug/<video_id>': 'List available transcripts',
             '/ai/complete (POST)': 'AI text completion'
         }
@@ -315,46 +390,68 @@ def get_transcript_endpoint(video_id):
                 'word_count': len(result.split()),
             }), 200
 
-    except TranscriptsDisabled:
-        logger.warning(f"Transcripts disabled for video: {video_id}")
-        return jsonify({
-            'success': False,
-            'error': 'Transcripts are disabled for this video',
-            'video_id': video_id
-        }), 403
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, RequestBlocked, Exception) as primary_error:
+        # Try Supadata as server-side fallback before returning error
+        logger.info(f"Primary transcript fetch failed for {video_id}, trying Supadata fallback...")
+        try:
+            result, language, is_generated = get_supadata_transcript(video_id, include_timestamps)
 
-    except NoTranscriptFound:
-        logger.warning(f"No transcript found for video: {video_id}")
-        return jsonify({
-            'success': False,
-            'error': 'No transcript found for this video',
-            'video_id': video_id
-        }), 404
+            if include_timestamps:
+                logger.info(f"Supadata fallback succeeded ({len(result)} segments)")
+                return jsonify({
+                    'success': True,
+                    'video_id': video_id,
+                    'segments': result,
+                    'language': language,
+                    'is_generated': is_generated,
+                    'source': 'supadata',
+                }), 200
+            else:
+                logger.info(f"Supadata fallback succeeded ({len(result)} chars)")
+                return jsonify({
+                    'success': True,
+                    'video_id': video_id,
+                    'transcript': result,
+                    'language': language,
+                    'is_generated': is_generated,
+                    'word_count': len(result.split()),
+                    'source': 'supadata',
+                }), 200
+        except Exception as supadata_error:
+            logger.warning(f"Supadata fallback also failed: {supadata_error}")
 
-    except VideoUnavailable:
-        logger.warning(f"Video unavailable: {video_id}")
-        return jsonify({
-            'success': False,
-            'error': 'Video is unavailable or does not exist',
-            'video_id': video_id
-        }), 404
-
-    except RequestBlocked:
-        logger.error(f"Request blocked by YouTube for video: {video_id}")
-        return jsonify({
-            'success': False,
-            'error': 'Request blocked by YouTube',
-            'video_id': video_id
-        }), 429
-
-    except Exception as e:
-        logger.error(f"Unexpected error for {video_id}: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': 'An error occurred while fetching the transcript',
-            'hint': str(e),
-            'video_id': video_id
-        }), 500
+        # Return the original error
+        if isinstance(primary_error, TranscriptsDisabled):
+            return jsonify({
+                'success': False,
+                'error': 'Transcripts are disabled for this video',
+                'video_id': video_id
+            }), 403
+        elif isinstance(primary_error, NoTranscriptFound):
+            return jsonify({
+                'success': False,
+                'error': 'No transcript found for this video',
+                'video_id': video_id
+            }), 404
+        elif isinstance(primary_error, VideoUnavailable):
+            return jsonify({
+                'success': False,
+                'error': 'Video is unavailable or does not exist',
+                'video_id': video_id
+            }), 404
+        elif isinstance(primary_error, RequestBlocked):
+            return jsonify({
+                'success': False,
+                'error': 'Request blocked by YouTube',
+                'video_id': video_id
+            }), 429
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'An error occurred while fetching the transcript',
+                'hint': str(primary_error),
+                'video_id': video_id
+            }), 500
 
 
 @app.route('/transcript', methods=['POST'])
@@ -404,6 +501,44 @@ def debug_transcripts(video_id):
             'count': len(available)
         }), 200
     except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'video_id': video_id
+        }), 500
+
+
+# =============================================================================
+# ROUTES - Metadata
+# =============================================================================
+
+@app.route('/metadata/<video_id>', methods=['GET'])
+@require_api_key
+def get_metadata_endpoint(video_id):
+    """Get video metadata (duration, title, etc.) via Supadata."""
+    if not is_valid_video_id(video_id):
+        return jsonify({
+            'success': False,
+            'error': 'Invalid video ID format'
+        }), 400
+
+    try:
+        data = get_supadata_metadata(video_id)
+        duration = None
+        media = data.get('media')
+        if media:
+            duration = media.get('duration')
+
+        return jsonify({
+            'success': True,
+            'video_id': video_id,
+            'title': data.get('title'),
+            'duration': duration,
+            'channel': data.get('author', {}).get('displayName'),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Metadata fetch failed for {video_id}: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e),
