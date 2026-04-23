@@ -8,8 +8,12 @@ Flask application for:
 
 import os
 import re
+import json
+import base64
+import hashlib
 import logging
 import requests
+from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -52,6 +56,26 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # Initialize YouTube transcript API
 ytt_api = YouTubeTranscriptApi()
+
+# Firebase initialization
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+FIREBASE_CREDENTIALS_B64 = os.environ.get('FIREBASE_CREDENTIALS')
+IP_HASH_SALT = os.environ.get('IP_HASH_SALT', 'quiva-default-salt')
+db = None
+
+if FIREBASE_CREDENTIALS_B64:
+    try:
+        cred_json = json.loads(base64.b64decode(FIREBASE_CREDENTIALS_B64))
+        cred = credentials.Certificate(cred_json)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        logger.info("Firebase initialized successfully")
+    except Exception as e:
+        logger.error(f"Firebase initialization failed: {e}")
+else:
+    logger.warning("FIREBASE_CREDENTIALS not set - raffle endpoints disabled")
 
 
 # =============================================================================
@@ -105,6 +129,18 @@ def extract_video_id(url):
 def is_valid_video_id(video_id):
     """Check if a string is a valid YouTube video ID."""
     return bool(re.match(r'^[a-zA-Z0-9_-]{11}$', video_id))
+
+
+def is_valid_email(email):
+    """Basic email format validation."""
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return bool(re.match(pattern, email)) and len(email) <= 254
+
+
+def hash_ip(ip_address):
+    """Hash IP address for GDPR-compliant storage."""
+    salted = f"{IP_HASH_SALT}:{ip_address}"
+    return hashlib.sha256(salted.encode()).hexdigest()
 
 
 # =============================================================================
@@ -262,7 +298,9 @@ def home():
             '/transcript/<video_id>': 'Get transcript by video ID',
             '/transcript (POST)': 'Get transcript by URL',
             '/debug/<video_id>': 'List available transcripts',
-            '/ai/complete (POST)': 'AI text completion'
+            '/ai/complete (POST)': 'AI text completion',
+            '/raffle (POST)': 'Enter launch raffle',
+            '/raffle (DELETE)': 'GDPR erasure for raffle entry'
         }
     })
 
@@ -470,6 +508,127 @@ def ai_complete():
         return jsonify({
             'success': False,
             'error': 'An unexpected error occurred'
+        }), 500
+
+
+# =============================================================================
+# ROUTES - Raffle
+# =============================================================================
+
+@app.route('/raffle', methods=['POST'])
+@require_api_key
+@limiter.limit("5 per hour")
+def raffle_entry():
+    """Submit a raffle entry."""
+    if not db:
+        return jsonify({
+            'success': False,
+            'error': 'Raffle service unavailable'
+        }), 503
+
+    data = request.get_json()
+
+    if not data or 'email' not in data:
+        return jsonify({
+            'success': False,
+            'error': 'Missing "email" in request body'
+        }), 400
+
+    email = data['email'].strip().lower()
+    marketing_consent = bool(data.get('marketing_consent', False))
+
+    if not is_valid_email(email):
+        return jsonify({
+            'success': False,
+            'error': 'Invalid email format'
+        }), 400
+
+    try:
+        collection = db.collection('raffle_entries')
+        existing = list(collection.where('email', '==', email).limit(1).get())
+
+        if len(existing) > 0:
+            return jsonify({
+                'success': False,
+                'error': 'This email is already entered in the raffle'
+            }), 409
+
+        entry = {
+            'email': email,
+            'marketing_consent': marketing_consent,
+            'created_at': datetime.now(timezone.utc),
+            'ip_hash': hash_ip(request.remote_addr or 'unknown'),
+            'source': data.get('source', 'landing_page')
+        }
+        collection.add(entry)
+
+        logger.info(f"New raffle entry from {hash_ip(request.remote_addr or 'unknown')}")
+        return jsonify({
+            'success': True,
+            'message': 'You have been entered into the raffle!'
+        }), 201
+
+    except Exception as e:
+        logger.error(f"Error creating raffle entry: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'An error occurred while processing your entry'
+        }), 500
+
+
+@app.route('/raffle', methods=['DELETE'])
+@require_api_key
+@limiter.limit("5 per hour")
+def raffle_delete():
+    """Delete a raffle entry (GDPR erasure)."""
+    if not db:
+        return jsonify({
+            'success': False,
+            'error': 'Raffle service unavailable'
+        }), 503
+
+    data = request.get_json()
+
+    if not data or 'email' not in data:
+        return jsonify({
+            'success': False,
+            'error': 'Missing "email" in request body'
+        }), 400
+
+    email = data['email'].strip().lower()
+
+    if not is_valid_email(email):
+        return jsonify({
+            'success': False,
+            'error': 'Invalid email format'
+        }), 400
+
+    try:
+        collection = db.collection('raffle_entries')
+        docs = collection.where('email', '==', email).get()
+        deleted = 0
+
+        for doc in docs:
+            doc.reference.delete()
+            deleted += 1
+
+        if deleted == 0:
+            return jsonify({
+                'success': False,
+                'error': 'No entry found for this email'
+            }), 404
+
+        logger.info(f"Deleted {deleted} raffle entry/entries for GDPR request")
+        return jsonify({
+            'success': True,
+            'message': 'Your raffle entry has been deleted'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error deleting raffle entry: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'An error occurred while processing your request'
         }), 500
 
 
